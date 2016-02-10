@@ -1,0 +1,402 @@
+
+## simple multi-homed, tx-stateful load balancer setup.
+## - routing/processing servers will be on 10.0.6.0/24 network.
+## - so be careful traversing interfaces & protocols!
+## - no disk/db/dns/etc io that would block any request (the routing/processing
+##   servers do all that work), nor should this proxy be dialog stateful;
+##   in a nutshell this system needs to be as absolutely reliable and simple as possible.
+## - no cdr recording
+## - no logging! don't want to worry about hd filling up for next 20 years
+##
+## This is for opensips 1.8 or 1.9 (using new drouting features)
+
+## for drouting & pike module need config of IP addresses -- requires a db but you can use
+##   dbtext; but that's a hassle .. just use mysql and ensure that this instance only
+##   reads config at startup and doesn't need the db at any time else.
+
+## TODO use drouting module (with only local file db?) for inbound load
+## balancing & failover, and to have a current list of trunks with
+## IP addresses to check for auth.
+
+
+####### Global Parameters #########
+
+debug=2
+log_stderror=no
+log_facility=LOG_LOCAL7
+
+fork=yes
+children=4
+
+#debug=6
+#fork=no
+#log_stderror=yes
+
+
+# TODO prevent *all* DNS lookups
+#disable_dns_blacklist=no
+rev_dns=no
+
+
+listen=udp:10.0.6.100:5060
+listen=udp:70.102.5.26:5060
+
+auto_aliases=no
+
+# apperently this is time consuming to enable, so you could manually force src socket
+mhomed=1
+
+disable_tcp=no
+#disable_tls=yes
+
+user_agent_header="User-Agent: clogic/OpenSIPs/1.9"
+
+
+####### Modules Section ########
+
+#set module path
+mpath="/usr/lib/opensips/modules/"
+
+loadmodule "db_mysql.so"
+loadmodule "signaling.so"
+loadmodule "sl.so"
+loadmodule "tm.so"
+loadmodule "rr.so"
+loadmodule "maxfwd.so"
+loadmodule "textops.so"
+loadmodule "sipmsgops.so"
+loadmodule "uri.so"
+loadmodule "pike.so"
+loadmodule "mi_fifo.so"
+loadmodule "drouting.so"
+loadmodule "dispatcher.so"
+
+# haproxy on same host as LB
+modparam("drouting|dispatcher", "db_url", "mysql://opensips:barf@10.0.6.100/opensips")
+
+
+modparam("drouting", "drr_table", "dr_rules_lb")  # LB doesn't do any LCR, so use another empty dr_rules table to avoid loading the entire route table in memory
+modparam("drouting", "use_domain", 0)
+modparam("drouting", "probing_interval", 60) # quickly detect a down CP node (no othe gateways are pinged)
+modparam("drouting", "probing_from", "sip:hello@10.0.6.100")
+modparam("drouting", "probing_method", "OPTIONS")
+modparam("drouting", "probing_reply_codes", "501, 403, 404, 405")
+modparam("drouting", "ruri_avp", '$avp(dr_ruri)')
+modparam("drouting", "gw_id_avp", '$avp(dr_gw_id)')
+modparam("drouting", "gw_attrs_avp", '$avp(dr_gw_attrs)')
+
+
+modparam("dispatcher", "flags", 3)
+modparam("dispatcher", "use_default", 0)
+modparam("dispatcher", "force_dst", 1)
+modparam("dispatcher", "dst_avp", "$avp(ds_dst)")
+modparam("dispatcher", "grp_avp", "$avp(ds_grp)")
+modparam("dispatcher", "ds_ping_from", "sip:hello@10.0.6.100")
+modparam("dispatcher", "ds_ping_interval", 6) # shorten to 1 second for production - used for internal CP nodes only
+modparam("dispatcher", "ds_probing_threshhold", 2)
+modparam("dispatcher", "ds_probing_mode", 1)
+
+
+# I wonder if the pings are done in a separate timer thread ... if not you need
+# to figure out if there's a performance penalty (i.e. some blocking op) for too
+# low an interval (moot point: drouting only loads during startup & reload, but still ...)
+modparam("db_mysql", "ping_interval", 30)
+modparam("db_mysql", "timeout_interval", 1)
+
+
+modparam("mi_fifo", "fifo_name", "/tmp/opensips_fifo")
+modparam("mi_fifo", "fifo_mode", 0666)
+
+
+# short timeouts: TODO want normal timeout for outbound, short timeout for inbound (see fr_timer_avp)
+modparam("tm", "fr_timer", 4)
+modparam("tm", "fr_inv_timer", 60)
+# TODO investigate this ... sometimes you might get a long duration of provisional replies because carrier needs to locate a mobile subscriber
+
+modparam("rr", "append_fromtag", 0)
+modparam("rr", "enable_double_rr", 1)  # experiemnt with this
+
+modparam("uri", "use_uri_table", 0)
+
+
+modparam("pike", "sampling_time_unit", 30)
+modparam("pike", "reqs_density_per_unit", 160)
+
+
+####### Routing Logic ########
+
+# main request routing logic
+
+route {
+
+    route(REQINIT);
+
+    if (has_totag()) route(WITHINDLG);
+
+
+
+
+    ##
+    #---- initial requests (no To tag) section ----#
+    ##
+
+
+	# CANCEL processing   TODO make sure this gets routed to CP node so we can record all call attempst, even before early dialog
+	if (is_method("CANCEL"))
+	{
+        # XXX knows where to send it? this is for the case where invite is cancelled, before we
+        # have dialog state and full route set!
+		if (t_check_trans()) t_relay();
+
+		exit();
+	}
+
+
+    #---- catch retransmissions ----#
+	t_check_trans();
+
+
+    if (uri==myself) {  # inbound call
+
+        xlog("new inbound req: src=$var(clsrc3) (expecting 3);  ru=$ru");
+
+        # preloaded route checking (this is a new request for a new dialog, so we should not see any Route headers)
+        if (loose_route()) { # true== req contains Route header
+            xlog("L_ERR", "Attempt to route with preloaded Route's [$fu/$tu/$ru/$ci]");
+            if (!is_method("ACK"))
+                sl_send_reply("403","Preload Route denied");
+            exit;
+        }
+
+        # note: only record_route() on outbound leg.  below here is a new request, which at present means
+        # it has to have come from an external inbound carrier.
+
+
+        if ($rU==NULL) {
+            # request with no Username in RURI
+            sl_send_reply("484","Address Incomplete");
+            exit;
+        }
+
+
+
+        # then must be a new request from an inbound trunk/customer: load balance to one of the 
+        # interal call processing nodes (TODO smaller tx timeout)
+        record_route();
+        route(external2internal);
+
+
+    } else { # outbound
+
+        xlog("new outbound req: src=$var(clsrc3) (expecting 1);  ru=$ru");
+
+        record_route();
+        route(generic_relay);
+    }
+
+
+
+    send_reply("404", "Invalid Extension");
+    exit;
+}
+
+
+#------------------------------------------------------------------------------
+#------------------------------------------------------------------------------
+
+
+# sanity check request, determine & authorize source IP, pike flood check
+route[REQINIT] {
+
+    # check source of request from dr_gateways table.
+    # types: 1 == internal CP/LB node
+    #        2 == terminating carrier trunks
+    #        3 == inbound customer trunk
+
+    $var(clsrc3) = 0; # start out assume unknown source of this request
+
+    # warning: is_from_gw may only match on port 5060 (but in some versions of opensips)
+    if (is_from_gw("1", "a"))      $var(clsrc3) = 1;
+    else if (is_from_gw("2", "a")) $var(clsrc3) = 2;
+    else if (is_from_gw("3", "a")) $var(clsrc3) = 3;
+
+    # use X-CL-src3 header to communicate request source to CP nodes (but remove & don't use for any other requests)
+    remove_hf("X-CL-src3");
+    if ($var(clsrc3) > 1) {
+        append_hf("X-CL-src3: $avp(dr_gw_attrs)\r\n");
+        #xlog("request from inbound carrier/customer: dr_gw_attrs = $avp(dr_gw_attrs)");
+    }
+
+
+    # pike flood check, other sanity checks here ...
+    if ($var(clsrc3) == 0) {
+        if (! pike_check_req()) {
+            xlog("pike block!");
+            # TODO do something here ...
+            drop();
+            exit();
+        }
+    }
+
+
+
+    # OPTIONS should be used to query actual user's capabilites?
+    if (is_method("OPTIONS")) {
+        sl_send_reply("200", "OK");
+        exit();
+    }
+
+	if (is_method("PUBLISH|SUBSCRIBE|REGISTER|MESSAGE"))
+	{
+		sl_send_reply("503", "Service Unavailable");
+		exit();
+	}
+
+
+    #xlog(">>> msg from $si:$sp: $rm $ru / From $fu");
+    #xlog("$mb\n\n");
+
+    if (!mf_process_maxfwd_header("10")) {
+        send_reply("483","Too Many Hops");
+        exit;
+    }
+
+
+    # src IP check.  Note: normally this should go below the WITHINDLG section, but because we are doing record-routing, we
+    # are setting policy that it is requred for all requests to come only from authorized IPs, so it's OK to do this here.
+    if ($var(clsrc3) < 1) {
+        xlog("denying src IP $si  ru=$ru");
+        send_reply("403","src forbidden");
+        exit;
+    }
+    
+
+    return;
+}
+
+
+route[WITHINDLG] {
+
+    #---- Sequential requests section ----#
+    # sequential request withing a dialog should
+    # take the path determined by record-routing
+    #
+    # see http://www.mail-archive.com/sr-users@lists.sip-router.org/msg08973.html for problem
+    # with some BYE/ACK/re-INVITE requests missing Route headers
+
+
+
+
+    if (loose_route()) { # then there is a Route header (and doesn't indicate this proxy)
+
+        #xlog("withindlg, loose_routed req: src=$var(clsrc3) ; ru=$ru du=$du");
+        #if (uri==myself) xlog(" ... uri==myself");
+        #else xlog(" ... uri!=myself");
+
+        if (is_method("INVITE")) {
+            record_route(); # wouldn't a reINVITE already hold the Route set?
+        }
+
+        ## to CP node, load balance / failover
+        # .. you maybe don't really want every new request to go to a different CP .. only invoke load balancing
+        # if we know for a fact that current $du is down.  UPDATE: looks like ds_select_ds already takes
+        # care of this
+        if ($du && dr_is_gw("$du", "1")) route(external2internal);
+
+        else route(generic_relay);
+
+
+    } else {
+
+        #xlog("withindlg, ! loose_routed req: src=$var(clsrc3) ; ru=$ru du=$du");
+        #if (uri==myself) xlog(" ... uri==myself");
+        #else xlog(" ... uri!=myself");
+
+        # 1 case where request wont have a Route header: when this proxy failed the transaction and returns a final
+        # reply, we absorb the ACK sent by the UAC
+        if (is_method("ACK")) {
+            if (t_check_trans()) {
+                t_relay();
+            }
+            exit;
+        }
+        else {
+            xlog("hmmm ... $rm / $ru");
+        }
+
+        send_reply("404","Not here");
+        exit;
+    }
+
+}
+
+
+route[external2internal] {
+
+    if (ds_select_dst("1", "0")) {# dispatcher sets $du (outbound proxy), doesn't modify req uri (unlike drouting)
+
+        #xlog("external2internal: will forward to $du");
+
+        #force_send_socket(10.0.6.100);
+        t_on_failure("gw_failure");
+        route(generic_relay);
+    }
+    else {
+        xlog("*ERROR* no more destinations found by dispatcher");
+        send_reply("502", "Bad Gateway");
+        exit;
+    }
+
+}
+
+
+route[generic_relay] {
+
+    if (!t_relay()) {
+        send_reply("500","Internal Error");
+    };
+
+    exit;
+}
+
+
+
+onreply_route {
+    if (! is_method("OPTIONS")) {
+        #xlog(">>> received a reply (method=$rm) from $si: $rs - $rr\n");
+    }
+}
+
+
+
+# failure_route: timeout errors will trigger this block too
+failure_route[gw_failure] {
+
+	if (t_was_cancelled()) {
+		exit;
+	}
+
+    xlog("failure_route called - rs=$rs rr=$rr  T_reply_code=$T_reply_code");
+    if (t_local_replied("all")) {
+        xlog (" - no reply received\n");
+    }
+
+
+
+    if (t_check_status("(408|403)|([56][0-9][0-9])")) {
+
+        if (ds_next_dst()) {
+            xlog (" using next gateway $du from dispatcher");
+            t_relay();
+            exit;
+
+        } else {
+            xlog (" ! no more CP nodes to try from dispatcher");
+            t_reply("503", "service not available");
+            exit;
+        }
+    }
+
+}
+
+

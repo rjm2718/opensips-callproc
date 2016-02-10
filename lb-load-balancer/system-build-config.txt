@@ -1,0 +1,80 @@
+
+virtualbox notes:
+
+TODO: enable vt-x virtualiztion features in HP BIOS (and setup iLO network while you're there),
+then reenable with "vboxmanage modifyvm a100 --hwvirtex on"
+
+
+--------------------------------------
+
+For load balancer node we want to be very frugal when it comes to writing anythign to disk.
+
+/etc/rsyslog.d/50-defaul.conf:
+
+ supress opensips messages from /var/log/syslog:
+
+*.*;auth,authpriv.none;opensips.none        -/var/log/syslog
+
+- local7.* /var/log/opensips.log
+
+
+opensips.cfg:
+
+debug=1
+log_stderror=no
+log_facility=LOG_LOCAL7
+
+
+
+TODO logrotate
+
+
+--------------------------------------
+
+For CP node:
+
+ Why do need RPC to an app?
+
+ - for LCR processing, use drouting if you can .. better to have a system somebody else can learn and support.
+
+ - for strip/prefix number format mangling: drouting can do this for r-uri, but for other fields you need to hack away in opensips.cfg, so this could be done more elegantly in code.
+
+ - may need to implement special business logic different for each customer?  what about custom call limits?
+
+ - look into opensips event processing options too ...
+
+
+
+
+TODO: topology hiding (dialog module .. or more comliated b2bua module)?
+
+
+*note on drouting probing*
+
+ - obviously the CP nodes need good info on what routes are available, but out-of-the-box drouting probing wont work because the CP is on a pvt interface behind the LB node... shit.  Could hack something to communicate state from the LB to all child CP nodes (e.g. use MI to set carriers enabled or disabled).
+
+
+*note on From/To/Contact header rewriting*
+
+Level 3 wants us to look like we have a SBC, not a proxy, so we'll do our best to hide topology & rewrite headers without having to have the LB be dialog stateful or too complex.
+
+> because record routing is used, we shouldn't care about rewriting Contact host field (L3 still wants the userpart to be e.164)
+
+>
+
+
+*note on do_routing()*
+
+Sets a new request URI ==> see the $ru and related variables.  Not to be confused with destination URI ==> see $du and friends.  The latter can be set to route to an outbound proxy, the former is what is used in the request and route headers.
+
+
+
+
+
+
+
+
+
+
+
+

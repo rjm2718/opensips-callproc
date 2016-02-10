@@ -1,0 +1,34 @@
+RDSG CDR format:
+
+OLD                      NEW (2013/12/4)
+
+                         Call-Id,
+start timestamp          start timestamp,
+conn timestamp           conn timestamp,
+end timestamp            end timestamp,
+setup seconds            setup seconds,
+conn seconds             conn seconds,
+conn seconds (r)         conn seconds (r),
+total seconds            total seconds,
+from code                from code, (now in quotes)
+origination type         to code, (now in quotes)
+to code                  final status,
+final status             anum caller-id,
+anum caller-id           anum caller-id 2,
+anum caller-id 2         origination type,
+anum state               anum state,
+anum LATA                anum LATA,
+anum OCN                 anum OCN,
+bnum called num          bnum called num,
+bnum LRN                 bnum LRN,
+bnum state               bnum country,
+bnum LATA                bnum state,
+bnum OCN                 bnum LATA,
+bnum country             bnum OCN,
+juristiction             jurisdiction,
+lcr rule id              lcr rule id,
+route table              route table,
+route minute price       price table,
+call price               route minute price,
+call-id                  call price,
+
